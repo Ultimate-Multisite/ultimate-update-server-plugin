@@ -55,7 +55,10 @@ printf( esc_html__( 'Great news! A new version of %s is now available.', 'wp-upd
 </p>
 
 <p style="color: #666; font-size: 12px; margin-top: 30px;">
-	<?php esc_html_e( 'You are receiving this email because you purchased this product. You can manage your email preferences in your account settings.', 'wp-update-server-plugin' ); ?>
+	<?php esc_html_e( 'You are receiving this email because you purchased this product.', 'wp-update-server-plugin' ); ?>
+	<a href="<?php echo esc_url( wc_get_account_endpoint_url( 'edit-account' ) ); ?>" style="color: #666;">
+		<?php esc_html_e( 'Unsubscribe from release emails', 'wp-update-server-plugin' ); ?>
+	</a>
 </p>
 
 <?php

@@ -41,7 +41,9 @@ echo esc_url( wc_get_account_endpoint_url( 'downloads' ) ) . "\n\n";
 
 echo "----------------------------------------\n\n";
 
-echo esc_html__( 'You are receiving this email because you purchased this product. You can manage your email preferences in your account settings.', 'wp-update-server-plugin' ) . "\n\n";
+echo esc_html__( 'You are receiving this email because you purchased this product.', 'wp-update-server-plugin' ) . "\n";
+/* translators: %s: URL to account edit page */
+echo sprintf( esc_html__( 'Unsubscribe from release emails: %s', 'wp-update-server-plugin' ), esc_url( wc_get_account_endpoint_url( 'edit-account' ) ) ) . "\n\n";
 
 /**
  * Show user-defined additional content - this is set in each email's settings.
