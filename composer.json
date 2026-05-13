@@ -14,7 +14,8 @@
     ],
     "type": "wordpress-plugin",
     "require": {
-        "yahnis-elsts/wp-update-server": "^2.0"
+        "yahnis-elsts/wp-update-server": "^2.0",
+        "cweagans/composer-patches": "^1.7"
     },
     "require-dev": {
         "szepeviktor/phpstan-wordpress": "^2.0",
@@ -22,7 +23,16 @@
     },
     "config": {
         "allow-plugins": {
-            "phpstan/extension-installer": true
+            "phpstan/extension-installer": true,
+            "cweagans/composer-patches": true
         }
+    },
+    "extra": {
+        "patches": {
+            "yahnis-elsts/wp-update-server": {
+                "Feature-detect GLOB_BRACE for musl-libc PHP builds (Alpine, static FrankenPHP)": "patches/wp-update-server-glob-brace-musl.patch"
+            }
+        },
+        "composer-exit-on-patch-failure": true
     }
 }
