@@ -28,6 +28,34 @@ class Product_Versions {
 	const CACHE_EXPIRATION = HOUR_IN_SECONDS;
 
 	/**
+	 * Remote archive inspection timeout, in seconds.
+	 *
+	 * @var int
+	 */
+	const REMOTE_ARCHIVE_TIMEOUT = 15;
+
+	/**
+	 * Maximum redirects allowed while fetching remote archives for inspection.
+	 *
+	 * @var int
+	 */
+	const REMOTE_ARCHIVE_REDIRECTION_LIMIT = 3;
+
+	/**
+	 * Maximum bytes to download when inspecting a remote archive.
+	 *
+	 * @var int
+	 */
+	const REMOTE_ARCHIVE_MAX_BYTES = 52428800;
+
+	/**
+	 * Cache expiration for successfully extracted remote archive metadata.
+	 *
+	 * @var int
+	 */
+	const REMOTE_VERSION_CACHE_EXPIRATION = DAY_IN_SECONDS;
+
+	/**
 	 * Get all versions of a product by SKU.
 	 *
 	 * @param string $sku The product SKU.
@@ -109,7 +137,9 @@ class Product_Versions {
 	private static function extract_version_from_file(\WC_Product $product, string $file_id, \WC_Product_Download $file): ?array {
 
 		$file_info = \WC_Download_Handler::parse_file_path($product->get_file_download_path($file_id));
-		$filepath  = $file_info['file_path'];
+		$filepath         = $file_info['file_path'];
+		$tmp              = null;
+		$remote_cache_key = null;
 
 		// Handle remote files
 		if ($file_info['remote_file']) {
@@ -120,41 +150,171 @@ class Product_Versions {
 				return ['version' => $version];
 			}
 
-			// Download temporarily if we need to inspect the archive
-			require_once ABSPATH . 'wp-admin/includes/file.php';
-			$tmp = wp_tempnam($file->get_name());
-			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
-			file_put_contents($tmp, file_get_contents($filepath));
+			$remote_cache_key = self::get_remote_version_cache_key(
+				(int) $product->get_id(),
+				$file_id,
+				$file->get_name(),
+				$filepath
+			);
+			$cached_version_info = self::get_cached_remote_version_info($remote_cache_key);
+
+			if ($cached_version_info) {
+				return $cached_version_info;
+			}
+
+			// Download temporarily if we need to inspect the archive.
+			$tmp = self::download_remote_archive_for_inspection($filepath, $file->get_name());
+
+			if (null === $tmp) {
+				return null;
+			}
+
 			$filepath = $tmp;
 		}
 
-		if ( ! is_file($filepath) || ! is_readable($filepath)) {
-			return null;
-		}
-
-		// Try to get version from Wpup_Package
 		try {
+			if ( ! is_file($filepath) || ! is_readable($filepath)) {
+				return null;
+			}
+
+			// Try to get version from Wpup_Package
 			$package  = \Wpup_Package::fromArchive($filepath);
 			$metadata = $package->getMetadata();
 
 			$version_info = ['version' => $metadata['version'] ?? '0.0.0'];
 
-			// Clean up temp file if we created one
-			if (isset($tmp) && $filepath === $tmp && file_exists($tmp)) {
-				wp_delete_file($tmp);
+			if ($remote_cache_key) {
+				set_transient($remote_cache_key, $version_info, self::REMOTE_VERSION_CACHE_EXPIRATION);
 			}
 
 			return $version_info;
-		} catch (\Exception $e) {
+		} catch (\Throwable $e) {
 			// Fallback to filename extraction
 			$version = self::extract_version_from_filename($file->get_name());
 
-			// Clean up temp file if we created one
-			if (isset($tmp) && file_exists($tmp)) {
-				wp_delete_file($tmp);
-			}
-
 			return $version ? ['version' => $version] : null;
+		} finally {
+			self::delete_temporary_archive($tmp);
+		}
+	}
+
+	/**
+	 * Build a privacy-safe transient key for remote archive metadata.
+	 *
+	 * The raw URL may contain signed download credentials, so only a hash is used
+	 * in the transient name.
+	 *
+	 * @param int    $product_id The product ID.
+	 * @param string $file_id    The WooCommerce download file ID.
+	 * @param string $file_name  The WooCommerce download file name.
+	 * @param string $url        The remote archive URL.
+	 * @return string The transient cache key.
+	 */
+	private static function get_remote_version_cache_key(int $product_id, string $file_id, string $file_name, string $url): string {
+
+		$identity = implode('|', [$product_id, $file_id, $file_name, $url]);
+
+		return 'remote_version_' . hash('sha256', $identity);
+	}
+
+	/**
+	 * Retrieve cached remote version metadata if it has the expected shape.
+	 *
+	 * @param string $cache_key The transient cache key.
+	 * @return array|null Cached version metadata or null when absent/invalid.
+	 */
+	private static function get_cached_remote_version_info(string $cache_key): ?array {
+
+		$cached = get_transient($cache_key);
+
+		if ( ! is_array($cached) || ! isset($cached['version']) || ! is_string($cached['version'])) {
+			return null;
+		}
+
+		return ['version' => $cached['version']];
+	}
+
+	/**
+	 * Download a remote archive to a temporary file using bounded HTTP settings.
+	 *
+	 * @param string $url       The remote archive URL.
+	 * @param string $file_name The WooCommerce download file name.
+	 * @return string|null Temporary file path, or null on controlled failure.
+	 */
+	private static function download_remote_archive_for_inspection(string $url, string $file_name): ?string {
+
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+
+		$tmp = wp_tempnam($file_name);
+
+		if ( ! is_string($tmp) || '' === $tmp) {
+			return null;
+		}
+
+		$response = wp_safe_remote_get(
+			$url,
+			[
+				'timeout'             => self::REMOTE_ARCHIVE_TIMEOUT,
+				'redirection'         => self::REMOTE_ARCHIVE_REDIRECTION_LIMIT,
+				'stream'              => true,
+				'filename'            => $tmp,
+				'limit_response_size' => self::REMOTE_ARCHIVE_MAX_BYTES,
+			]
+		);
+
+		if (is_wp_error($response)) {
+			self::delete_temporary_archive($tmp);
+
+			return null;
+		}
+
+		$response_code = (int) wp_remote_retrieve_response_code($response);
+
+		if ($response_code < 200 || $response_code >= 300) {
+			self::delete_temporary_archive($tmp);
+
+			return null;
+		}
+
+		$content_length = wp_remote_retrieve_header($response, 'content-length');
+
+		if (is_array($content_length)) {
+			$content_length = reset($content_length);
+		}
+
+		if (is_numeric($content_length) && (int) $content_length > self::REMOTE_ARCHIVE_MAX_BYTES) {
+			self::delete_temporary_archive($tmp);
+
+			return null;
+		}
+
+		if ( ! is_file($tmp) || ! is_readable($tmp)) {
+			self::delete_temporary_archive($tmp);
+
+			return null;
+		}
+
+		$downloaded_bytes = filesize($tmp);
+
+		if (false === $downloaded_bytes || $downloaded_bytes <= 0 || $downloaded_bytes >= self::REMOTE_ARCHIVE_MAX_BYTES) {
+			self::delete_temporary_archive($tmp);
+
+			return null;
+		}
+
+		return $tmp;
+	}
+
+	/**
+	 * Delete a temporary archive if one was created.
+	 *
+	 * @param string|null $filepath The temporary archive path.
+	 * @return void
+	 */
+	private static function delete_temporary_archive(?string $filepath): void {
+
+		if (null !== $filepath && file_exists($filepath)) {
+			wp_delete_file($filepath);
 		}
 	}
 
