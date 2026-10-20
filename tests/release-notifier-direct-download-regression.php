@@ -87,6 +87,10 @@ namespace WP_Update_Server_Plugin {
 		public static function get_all_versions_by_product_id(int $product_id): array {
 			return [];
 		}
+
+		public static function schedule_permission_backfill(int $product_id): void {
+			$GLOBALS['wu_permission_backfills'][] = $product_id;
+		}
 	}
 
 	require_once dirname(__DIR__) . '/inc/class-release-notifier.php';
@@ -125,6 +129,7 @@ namespace {
 	assert_true(1 === count($GLOBALS['wu_scheduled_actions']), 'a direct download update must schedule exactly one release batch');
 	assert_true('2.2.4' === $GLOBALS['wu_scheduled_actions'][0]['args']['version'], 'the release version must be extracted from a v-prefixed download name');
 	assert_true('wu-release-notifications' === $GLOBALS['wu_scheduled_actions'][0]['group'], 'the release batch must use the release notification Action Scheduler group');
+	assert_true([$product_id] === ($GLOBALS['wu_permission_backfills'] ?? []), 'a direct download update must grant the new files to existing buyers');
 
 	$notifier->detect_new_downloads($product_id, 0, $GLOBALS['wu_product_meta'][$product_id]['_downloadable_files']);
 	assert_true(1 === count($GLOBALS['wu_scheduled_actions']), 'WooCommerce and direct-meta hooks must not schedule duplicate batches');

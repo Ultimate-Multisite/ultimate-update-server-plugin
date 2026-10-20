@@ -60,21 +60,9 @@ class Update_Server extends \Wpup_UpdateServer {
 			return null;
 		}
 
-		/** @var \WC_Customer_Download_Data_Store $downloads_data_store */
-		$downloads_data_store = wc_get_container()->get(LegacyProxy::class)->get_instance_of(\WC_Data_Store::class, 'customer-download');
+		$permission = Product_Versions::get_reference_permission((int) $user_id, (int) $product_id);
 
-		$permissions = $downloads_data_store->get_downloads(
-			array(
-				'product_id' => $product_id,
-				'user_id'    => $user_id,
-				'orderby'    => 'permission_id',
-				'order'      => 'DESC',
-				'limit'      => 1,
-			)
-		);
-
-		if ( ! empty($permissions) ) {
-			$permission = $permissions[0];
+		if ( $permission ) {
 
 			// Ensure the user has permissions for all current files (including newly uploaded versions)
 			$product = wc_get_product($product_id);
