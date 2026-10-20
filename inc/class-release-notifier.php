@@ -204,6 +204,10 @@ class Release_Notifier {
 			return;
 		}
 
+		// Give existing buyers the new files on every order that still allows
+		// downloads, including when release tooling bypasses WooCommerce's save.
+		Product_Versions::schedule_permission_backfill( $product_id );
+
 		foreach ( $new_download_ids as $download_id ) {
 			if ( isset( $this->processed_downloads[ $product_id ][ $download_id ] ) ) {
 				continue;

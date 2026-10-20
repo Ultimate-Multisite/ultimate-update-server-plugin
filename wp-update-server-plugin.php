@@ -82,4 +82,11 @@ add_action('woocommerce_loaded', function () {
 	// explicit and avoids relying on that implementation detail.
 	global $wp_update_server_plugin_release_notifier;
 	$wp_update_server_plugin_release_notifier = new \WP_Update_Server_Plugin\Release_Notifier();
+
+	add_action(
+		\WP_Update_Server_Plugin\Product_Versions::BACKFILL_HOOK,
+		function ($product_id) {
+			\WP_Update_Server_Plugin\Product_Versions::backfill_product_permissions((int) $product_id);
+		}
+	);
 });

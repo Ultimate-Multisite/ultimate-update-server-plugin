@@ -471,15 +471,21 @@ class Product_Versions {
 			'user_id' => $user_id,
 		]);
 
-		// Group by product, keeping first permission per product for reference
-		$products_map          = [];
-		$reference_permissions = [];
+		// Group by product, then pick a permission whose order still allows downloads.
+		$products_map           = [];
+		$permissions_by_product = [];
 
 		foreach ($permissions as $permission) {
-			$product_id = $permission->get_product_id();
+			$permissions_by_product[ $permission->get_product_id() ][] = $permission;
+		}
 
-			if ( ! isset($reference_permissions[$product_id])) {
-				$reference_permissions[$product_id] = $permission;
+		$reference_permissions = [];
+
+		foreach ($permissions_by_product as $product_id => $product_permissions) {
+			$reference = self::select_reference_permission($product_permissions);
+
+			if ($reference) {
+				$reference_permissions[ $product_id ] = $reference;
 			}
 		}
 
@@ -540,7 +546,10 @@ class Product_Versions {
 		$order_id   = $permission->get_order_id();
 		$order      = wc_get_order($order_id);
 
-		if ( ! $order) {
+		// Never attach new files to a cancelled, refunded or otherwise
+		// non-downloadable order: WooCommerce rejects those links with
+		// "Invalid order", so the customer would see a version they cannot get.
+		if ( ! $order || ! $order->is_download_permitted()) {
 			return;
 		}
 
@@ -584,6 +593,7 @@ class Product_Versions {
 			// would bypass the yearly subscription limit.
 			$new_permissions = $downloads_data_store->get_downloads([
 				'user_id'     => $permission->get_user_id(),
+				'order_id'    => $order_id,
 				'product_id'  => $product_id,
 				'download_id' => $file_id,
 				'orderby'     => 'permission_id',
@@ -597,6 +607,159 @@ class Product_Versions {
 				$new_perm->save();
 			}
 		}
+	}
+
+	/**
+	 * Action Scheduler hook that grants newly released files to existing buyers.
+	 *
+	 * @var string
+	 */
+	const BACKFILL_HOOK = 'wu_backfill_product_download_permissions';
+
+	/**
+	 * Get the permission to build download links from for a user and product.
+	 *
+	 * A customer can hold permissions from several orders for the same product,
+	 * for example a cancelled or refunded subscription plus a newer active one.
+	 * Only an order that still allows downloads produces working links.
+	 *
+	 * @param int $user_id    The user ID.
+	 * @param int $product_id The product ID.
+	 * @return \WC_Customer_Download|null Null when no order grants access.
+	 */
+	public static function get_reference_permission(int $user_id, int $product_id): ?\WC_Customer_Download {
+
+		/** @var \WC_Customer_Download_Data_Store $downloads_data_store */
+		$downloads_data_store = wc_get_container()->get(LegacyProxy::class)->get_instance_of(\WC_Data_Store::class, 'customer-download');
+
+		$permissions = $downloads_data_store->get_downloads([
+			'user_id'    => $user_id,
+			'product_id' => $product_id,
+		]);
+
+		return self::select_reference_permission($permissions);
+	}
+
+	/**
+	 * Pick the best usable permission from a list for one product.
+	 *
+	 * Usable means the order exists, allows downloads and the permission has
+	 * not expired. Among usable permissions, prefer unlimited access, then the
+	 * latest expiry, then the newest permission.
+	 *
+	 * @param \WC_Customer_Download[] $permissions Permissions for one product.
+	 * @return \WC_Customer_Download|null
+	 */
+	public static function select_reference_permission(array $permissions): ?\WC_Customer_Download {
+
+		$best         = null;
+		$best_expires = null;
+		$order_states = [];
+
+		foreach ($permissions as $permission) {
+			$order_id = $permission->get_order_id();
+
+			if ( ! isset($order_states[ $order_id ])) {
+				$order                     = wc_get_order($order_id);
+				$order_states[ $order_id ] = $order && $order->is_download_permitted();
+			}
+
+			if ( ! $order_states[ $order_id ] || self::is_permission_expired($permission)) {
+				continue;
+			}
+
+			$expires = $permission->get_access_expires();
+			$expires = $expires ? $expires->getTimestamp() : PHP_INT_MAX;
+
+			if (
+				null === $best
+				|| $expires > $best_expires
+				|| ($expires === $best_expires && $permission->get_id() > $best->get_id())
+			) {
+				$best         = $permission;
+				$best_expires = $expires;
+			}
+		}
+
+		return $best;
+	}
+
+	/**
+	 * Whether a permission has expired, using WooCommerce's own cut-off.
+	 *
+	 * @param \WC_Customer_Download $permission The permission.
+	 * @return bool
+	 */
+	private static function is_permission_expired(\WC_Customer_Download $permission): bool {
+
+		$expires = $permission->get_access_expires();
+
+		return null !== $expires && $expires->getTimestamp() < strtotime('midnight', time());
+	}
+
+	/**
+	 * Queue a grant of the product's current files to every order that owns it.
+	 *
+	 * Release tooling may write `_downloadable_files` directly, which bypasses
+	 * WooCommerce Subscriptions' own new-file grant. Without this, customers
+	 * only received new versions lazily, through whichever order happened to
+	 * be looked up first.
+	 *
+	 * @param int $product_id The product ID.
+	 * @return void
+	 */
+	public static function schedule_permission_backfill(int $product_id): void {
+
+		$args = [$product_id];
+
+		if (function_exists('as_enqueue_async_action') && function_exists('as_has_scheduled_action')) {
+			if ( ! as_has_scheduled_action(self::BACKFILL_HOOK, $args, 'wu-update-server')) {
+				as_enqueue_async_action(self::BACKFILL_HOOK, $args, 'wu-update-server');
+			}
+
+			return;
+		}
+
+		self::backfill_product_permissions($product_id);
+	}
+
+	/**
+	 * Grant all current product files to every order that still allows downloads.
+	 *
+	 * @param int $product_id The product ID.
+	 * @return int Number of orders checked.
+	 */
+	public static function backfill_product_permissions(int $product_id): int {
+
+		$product = wc_get_product($product_id);
+
+		if ( ! $product || ! $product->is_downloadable()) {
+			return 0;
+		}
+
+		/** @var \WC_Customer_Download_Data_Store $downloads_data_store */
+		$downloads_data_store = wc_get_container()->get(LegacyProxy::class)->get_instance_of(\WC_Data_Store::class, 'customer-download');
+
+		$permissions = $downloads_data_store->get_downloads([
+			'product_id' => $product_id,
+			'orderby'    => 'permission_id',
+			'order'      => 'ASC',
+		]);
+
+		// Keep the newest unexpired permission per order as that order's reference.
+		$latest_by_order = [];
+
+		foreach ($permissions as $permission) {
+			if ( ! self::is_permission_expired($permission)) {
+				$latest_by_order[ $permission->get_order_id() ] = $permission;
+			}
+		}
+
+		foreach ($latest_by_order as $permission) {
+			self::ensure_download_permissions($product, $permission);
+		}
+
+		return count($latest_by_order);
 	}
 
 	/**
@@ -635,20 +798,11 @@ class Product_Versions {
 			return null;
 		}
 
-		/** @var \WC_Customer_Download_Data_Store $downloads_data_store */
-		$downloads_data_store = wc_get_container()->get(LegacyProxy::class)->get_instance_of(\WC_Data_Store::class, 'customer-download');
+		$permission = self::get_reference_permission($user_id, (int) $product_id);
 
-		$permissions = $downloads_data_store->get_downloads([
-			'product_id' => $product_id,
-			'user_id'    => $user_id,
-			'limit'      => 1,
-		]);
-
-		if (empty($permissions)) {
+		if ( ! $permission) {
 			return null;
 		}
-
-		$permission = $permissions[0];
 
 		// Ensure user has permissions for all current files
 		$product = wc_get_product($product_id);

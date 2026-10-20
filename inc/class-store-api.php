@@ -84,23 +84,17 @@ class Store_Api {
 			$latest = Product_Versions::get_latest_version_by_product_id($product_id, $include_beta);
 
 			if ($latest && isset($latest['file_id'])) {
-				$permissions = $data_store->get_downloads(
-					array(
-						'product_id' => $product_id,
-						'user_id'    => $user_id,
-						'limit'      => 1,
-					)
-				);
+				$permission = Product_Versions::get_reference_permission((int) $user_id, (int) $product_id);
 
-				if ( ! empty($permissions)) {
+				if ($permission) {
 					// Ensure user has permissions for all current files
-					Product_Versions::ensure_download_permissions($product, $permissions[0]);
+					Product_Versions::ensure_download_permissions($product, $permission);
 
 					$download_url = add_query_arg(
 						array(
-							'download_file' => $permissions[0]->get_product_id(),
-							'order'         => $permissions[0]->get_order_key(),
-							'email'         => rawurlencode($permissions[0]->get_user_email()),
+							'download_file' => $permission->get_product_id(),
+							'order'         => $permission->get_order_key(),
+							'email'         => rawurlencode($permission->get_user_email()),
 							'key'           => $latest['file_id'],
 						),
 						home_url('/')
