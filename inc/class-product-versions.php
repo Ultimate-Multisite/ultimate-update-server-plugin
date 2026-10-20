@@ -586,23 +586,13 @@ class Product_Versions {
 				continue;
 			}
 
-			wc_downloadable_file_permission($file_id, $product, $order);
+			$new_permission_id = wc_downloadable_file_permission($file_id, $product, $order);
 
 			// Sync the expiry to match the existing permission's subscription window.
 			// wc_downloadable_file_permission() calculates expiry from now, which
 			// would bypass the yearly subscription limit.
-			$new_permissions = $downloads_data_store->get_downloads([
-				'user_id'     => $permission->get_user_id(),
-				'order_id'    => $order_id,
-				'product_id'  => $product_id,
-				'download_id' => $file_id,
-				'orderby'     => 'permission_id',
-				'order'       => 'DESC',
-				'limit'       => 1,
-			]);
-
-			if ( ! empty($new_permissions)) {
-				$new_perm = $new_permissions[0];
+			if ($new_permission_id) {
+				$new_perm = new \WC_Customer_Download($new_permission_id);
 				$new_perm->set_access_expires($reference_expires);
 				$new_perm->save();
 			}
