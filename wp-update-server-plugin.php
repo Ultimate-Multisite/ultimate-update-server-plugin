@@ -89,4 +89,12 @@ add_action('woocommerce_loaded', function () {
 			\WP_Update_Server_Plugin\Product_Versions::backfill_product_permissions((int) $product_id);
 		}
 	);
+
+	// Renewals must extend access to every file, not only files granted later.
+	add_action(
+		'woocommerce_subscription_renewal_payment_complete',
+		[\WP_Update_Server_Plugin\Product_Versions::class, 'handle_subscription_renewal'],
+		20,
+		2
+	);
 });
