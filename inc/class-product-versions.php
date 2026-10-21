@@ -575,10 +575,16 @@ class Product_Versions {
 			$existing_file_ids[$perm->get_download_id()] = true;
 		}
 
-		// Capture the access_expires from the reference permission so new
-		// permissions inherit the same subscription expiry window instead of
-		// getting a fresh window calculated from now.
-		$reference_expires = $permission->get_access_expires();
+		// Every file on one order shares the order's access window. Use the
+		// latest dated expiry on the order, so a renewal that only refreshed
+		// some rows (or one newly granted file) extends the older versions too.
+		$reference_expires = self::get_order_access_window(array_merge($existing, [$permission]));
+
+		if (null !== $reference_expires) {
+			self::raise_access_expiry($existing, $reference_expires);
+		} else {
+			$reference_expires = $permission->get_access_expires();
+		}
 
 		// Grant permissions for any files the user doesn't have yet
 		foreach ($files as $file_id => $file) {
@@ -595,6 +601,116 @@ class Product_Versions {
 				$new_perm = new \WC_Customer_Download($new_permission_id);
 				$new_perm->set_access_expires($reference_expires);
 				$new_perm->save();
+			}
+		}
+	}
+
+	/**
+	 * Latest dated expiry among permissions of one order and product.
+	 *
+	 * Unlimited (null) rows are ignored: they were granted while the product
+	 * had no expiry and must not decide the window for dated rows.
+	 *
+	 * @param \WC_Customer_Download[] $permissions Permissions for one order and product.
+	 * @return \WC_DateTime|null Null when no permission carries a date.
+	 */
+	private static function get_order_access_window(array $permissions): ?\WC_DateTime {
+
+		$window = null;
+
+		foreach ($permissions as $permission) {
+			$expires = $permission->get_access_expires();
+
+			if ($expires && (null === $window || $expires->getTimestamp() > $window->getTimestamp())) {
+				$window = $expires;
+			}
+		}
+
+		return $window;
+	}
+
+	/**
+	 * Raise dated permissions that expire before the given date.
+	 *
+	 * Never shortens access and leaves unlimited permissions unlimited.
+	 *
+	 * @param \WC_Customer_Download[] $permissions Permissions to check.
+	 * @param \WC_DateTime            $expires     Target expiry.
+	 * @return int Number of permissions updated.
+	 */
+	private static function raise_access_expiry(array $permissions, \WC_DateTime $expires): int {
+
+		$updated = 0;
+
+		foreach ($permissions as $permission) {
+			$current = $permission->get_access_expires();
+
+			if ($current && $current->getTimestamp() < $expires->getTimestamp()) {
+				$permission->set_access_expires($expires->getTimestamp());
+				$permission->save();
+				++$updated;
+			}
+		}
+
+		return $updated;
+	}
+
+	/**
+	 * Extend a subscription's file permissions when a renewal is paid.
+	 *
+	 * WooCommerce computes access_expires once, when a file is granted, from the
+	 * order's completed date plus the product's download expiry. Subscription
+	 * renewals never move existing rows, so older versions expired while the
+	 * customer was still paying. Recompute the window from the renewal date,
+	 * apply it to every file of the subscription and grant any missing files.
+	 *
+	 * @param \WC_Subscription $subscription The renewed subscription.
+	 * @param \WC_Order|false  $last_order   The renewal order.
+	 * @return void
+	 */
+	public static function handle_subscription_renewal($subscription, $last_order = false): void {
+
+		if ( ! $subscription instanceof \WC_Order || ! $subscription->is_download_permitted()) {
+			return;
+		}
+
+		$renewal_date = null;
+
+		if ($last_order instanceof \WC_Order) {
+			$renewal_date = $last_order->get_date_completed() ?: $last_order->get_date_paid();
+		}
+
+		$from_date = $renewal_date ? $renewal_date->format('Y-m-d') : current_time('mysql', true);
+
+		/** @var \WC_Customer_Download_Data_Store $downloads_data_store */
+		$downloads_data_store = wc_get_container()->get(LegacyProxy::class)->get_instance_of(\WC_Data_Store::class, 'customer-download');
+
+		$by_product = [];
+
+		foreach ($downloads_data_store->get_downloads(['order_id' => $subscription->get_id()]) as $permission) {
+			$by_product[ $permission->get_product_id() ][] = $permission;
+		}
+
+		foreach ($by_product as $product_id => $permissions) {
+			$product = wc_get_product($product_id);
+
+			if ( ! $product) {
+				continue;
+			}
+
+			$expiry_days = (int) $product->get_download_expiry();
+
+			if ($expiry_days > 0) {
+				self::raise_access_expiry(
+					$permissions,
+					new \WC_DateTime('@' . strtotime($from_date . ' + ' . $expiry_days . ' DAY'))
+				);
+			}
+
+			$reference = self::select_reference_permission($permissions);
+
+			if ($reference) {
+				self::ensure_download_permissions($product, $reference);
 			}
 		}
 	}
